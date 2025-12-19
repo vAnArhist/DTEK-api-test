@@ -4,6 +4,7 @@
 import asyncio
 import json
 from datetime import datetime
+import argparse
 from urllib.parse import urlencode
 
 from playwright.async_api import async_playwright
@@ -11,10 +12,6 @@ from playwright.async_api import async_playwright
 BASE = "https://www.dtek-kem.com.ua"
 PAGE = f"{BASE}/ua/shutdowns"
 AJAX = f"{BASE}/ua/ajax"
-
-# Важливо: значення має бути рівно як у XHR
-STREET_VALUE = "вул. Борщагівська"
-HOUSE = "145"
 
 def pretty(obj) -> str:
     """Compact pretty JSON for console."""
@@ -79,7 +76,7 @@ def summarize_fact_for_today(j: dict, queue: str) -> str:
     return "📌 FACT (сьогодні):\n" + "\n".join(lines)
 
 
-async def fetch(street_value: str, *, headless: bool = False) -> dict:
+async def fetch(street_value: str, *, headless: bool = True) -> dict:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=headless,  # для дебагу зручно False
@@ -148,25 +145,34 @@ async def fetch(street_value: str, *, headless: bool = False) -> dict:
 
 
 async def main():
+    parser = argparse.ArgumentParser(description="Fetch DTEK shutdown info for a house")
+    parser.add_argument("-s", "--street", help="Street name (as in XHR)")
+    parser.add_argument("-H", "--house", help="House number")
+    parser.add_argument("--show-browser", action="store_true", help="Show browser window (disable headless)")
+    args = parser.parse_args()
+
+    street_value = "вул. " + args.street
+    house = args.house # or HOUSE
+
     # Ретраї (інколи 1-й може дати Error через антибот/таймінги)
     last = None
     for i in range(3):
         print(f"\n=== attempt {i + 1}/3 ===")
-        j = await fetch(STREET_VALUE, headless=False)
+        j = await fetch(street_value, headless=not args.show_browser)
         last = j
         if j.get("result") is True:
             break
         await asyncio.sleep(2)
 
     # 1) короткий summary по будинку
-    print("\n" + format_house_info(STREET_VALUE, HOUSE, last))
+    print("\n" + format_house_info(street_value, house, last))
 
     # 2) компактний debug: які будинки повернуло (перші 20 ключів)
     keys = list((last.get("data") or {}).keys())
     print("\n📦 data keys (first 20):", ", ".join(keys[:20]) + (" ..." if len(keys) > 20 else ""))
 
     # 3) покажемо queue + fact на сьогодні для цієї черги
-    queue = get_house_queue(last, HOUSE)
+    queue = get_house_queue(last, house)
     print("\n🏷️ queue:", queue or "—")
     if queue:
         print("\n" + summarize_fact_for_today(last, queue))
