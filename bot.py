@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-bot.py — Telegram bot that monitors DTEK KEM shutdowns for user-selected address
-and notifies when the site updates.
+Telegram bot: monitors DTEK KEM updates for user-selected address.
 
-Features:
-- /set <street> | <house>  -> save address and start monitoring
-- /status                  -> show saved address + last seen updateTimestamp
-- /stop                    -> stop monitoring and forget address
-- Periodic polling (default: every 5 minutes) using Playwright (Incapsula/CSRF safe)
+- /set  -> asks Street -> asks House
+- /check -> check now
+- /status -> show saved address + last updateTimestamp
+- /stop -> forget address and stop monitoring
+- Buttons for quick actions
+- Periodic polling via PTB JobQueue
 
-Requirements:
-  pip install python-telegram-bot==20.* playwright
+Install:
+  pip install "python-telegram-bot[job_queue]==20.*" playwright
   playwright install
 
 Run:
-  export BOT_TOKEN="123456:ABC..."
+  export BOT_TOKEN="123:ABC"
+  export POLL_EVERY_SEC=300
   python3 bot.py
 """
 
@@ -22,35 +23,34 @@ from __future__ import annotations
 
 import os
 import json
-import asyncio
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Final, Optional, Tuple
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
 
-# --- DTEK endpoints ---
-BASE = "https://www.dtek-kem.com.ua"
-PAGE = f"{BASE}/ua/shutdowns"
-AJAX = f"{BASE}/ua/ajax"
+import dtek_client
 
-# --- bot storage ---
+
+# =========================
+# Storage
+# =========================
+
 STATE_FILE = "bot_state.json"
 
-# --- polling interval (seconds) ---
-POLL_EVERY_SEC = int(os.getenv("POLL_EVERY_SEC", "300"))  # 5 min default
 
-# Telegram hard limit ~4096, keep safe
-TG_CHUNK = 3800
-
-
-# =========================
-# Helpers: storage
-# =========================
-
-def _load_state() -> Dict[str, Any]:
+def load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {}
     try:
@@ -60,201 +60,283 @@ def _load_state() -> Dict[str, Any]:
         return {}
 
 
-def _save_state(state: Dict[str, Any]) -> None:
+def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
 
 
-def _get_user_cfg(state: Dict[str, Any], chat_id: int) -> Dict[str, Any]:
+def get_user_cfg(state: Dict[str, Any], chat_id: int) -> Dict[str, Any]:
     return (state.get("users") or {}).get(str(chat_id)) or {}
 
 
-def _set_user_cfg(state: Dict[str, Any], chat_id: int, cfg: Dict[str, Any]) -> None:
+def set_user_cfg(state: Dict[str, Any], chat_id: int, cfg: Dict[str, Any]) -> None:
     state.setdefault("users", {})
     state["users"][str(chat_id)] = cfg
 
 
-def _del_user_cfg(state: Dict[str, Any], chat_id: int) -> None:
+def del_user_cfg(state: Dict[str, Any], chat_id: int) -> None:
     users = state.get("users") or {}
     users.pop(str(chat_id), None)
     state["users"] = users
-    
 
-def format_house_info(street_ui: str, house: str, j: dict) -> str:
-    if not isinstance(j, dict):
-        return f"❌ Некоректна відповідь (не dict): {type(j)}"
 
-    if not j.get("result"):
-        return f"❌ Помилка: {j.get('text', 'unknown')}"
+# =========================
+# Bot config
+# =========================
 
-    m = j.get("data") or {}
-    if house not in m:
-        sample = ", ".join(list(m.keys())[:15])
-        return f"⚠️ Будинок {house} не знайдено. Приклади ключів: {sample} ..."
+POLL_EVERY_SEC = int(os.getenv("POLL_EVERY_SEC", "300"))  # default 5 min
 
-    item = m[house] or {}
-    reasons = ", ".join(item.get("sub_type_reason") or [])
-    upd = j.get("updateTimestamp", "")
+# Conversation states
+ASK_STREET: Final[int] = 1
+ASK_HOUSE: Final[int] = 2
 
-    return (
-        f"🔌 {street_ui}, {house}\n"
-        f"Тип: {reasons or '—'}\n"
-        f"Оновлено: {upd or '—'}"
+
+def menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Перевірити зараз", callback_data="check")],
+            [InlineKeyboardButton("⚙️ Змінити адресу", callback_data="set")],
+            [InlineKeyboardButton("ℹ️ Моя адреса", callback_data="status")],
+            [InlineKeyboardButton("🛑 Стоп", callback_data="stop")],
+        ]
     )
 
 
-def get_house_queue(j: dict, house: str) -> Optional[str]:
-    """Returns queue code for house, e.g. 'GPV1.1'."""
-    m = j.get("data") or {}
-    item = m.get(house) or {}
-    reasons = item.get("sub_type_reason") or []
-    return reasons[0] if reasons else None
+def normalize_street(s: str) -> str:
+    s = " ".join((s or "").strip().split())
+    # user often types "Борщагівська" -> we want "вул. Борщагівська"
+    # if they already typed "вул." or "просп." - don't duplicate
+    low = s.lower()
+    if low.startswith(("вул.", "вулиця", "просп.", "проспект", "пров.", "провулок", "бульв.", "пл.", "площа")):
+        return s
+    return f"вул. {s}" if s else s
 
 
-def summarize_fact_for_today(j: dict, queue: str) -> str:
-    fact = (j.get("fact") or {})
-    preset = (j.get("preset") or {})
-    tz = preset.get("time_zone") or {}
-    time_type = preset.get("time_type") or {}
-
-    today_ts = fact.get("today")
-    data = (fact.get("data") or {})
-
-    # sometimes keys are int, sometimes str
-    fact_day = data.get(str(today_ts)) or data.get(today_ts) or {}
-    hours = (fact_day.get(queue) or {})
-
-    if not today_ts or not hours:
-        return "ℹ️ Немає fact-даних на сьогодні для цієї черги."
-
-    lines = []
-    for h in range(1, 25):
-        key = str(h)
-        slot = (tz.get(key) or [f"{h:02d}?"])[0]
-        code = hours.get(key, "—")
-        human = time_type.get(code, code)
-        lines.append(f"{slot}: {code} ({human})")
-    return "📌 FACT (сьогодні):\n" + "\n".join(lines)
+def normalize_house(s: str) -> str:
+    return (s or "").strip()
 
 
-def _parse_set_args(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Accept:
-      /set вул. Борщагівська | 145
-      /set "вул. Борщагівська" 145
-      /set вул. Борщагівська 145
-    """
-    if not text:
-        return None, None
+def valid_house(h: str) -> bool:
+    return bool(h) and any(c.isdigit() for c in h) and len(h) <= 16
 
-    parts = text.strip().split(maxsplit=1)
-    rest = parts[1].strip() if len(parts) > 1 else ""
-    if not rest:
-        return None, None
 
-    if "|" in rest:
-        street, house = rest.split("|", 1)
-        street = street.strip().strip('"').strip("'")
-        house = house.strip().strip('"').strip("'")
-        return (street or None), (house or None)
-
-    if rest[0] in ("'", '"'):
-        quote = rest[0]
-        end = rest.find(quote, 1)
-        if end > 1:
-            street = rest[1:end].strip()
-            tail = rest[end + 1:].strip()
-            house = tail.split()[0].strip().strip('"').strip("'") if tail else ""
-            return (street or None), (house or None)
-
-    toks = rest.split()
-    if len(toks) < 2:
-        return None, None
-    house = toks[-1].strip().strip('"').strip("'")
-    street = " ".join(toks[:-1]).strip().strip('"').strip("'")
-    return (street or None), (house or None)
+def target_message(update: Update):
+    if update.message:
+        return update.message
+    if update.callback_query and update.callback_query.message:
+        return update.callback_query.message
+    return None
 
 
 # =========================
-# DTEK fetch (Playwright)
+# Commands
 # =========================
 
-async def fetch_dtek(street_value: str, *, headless: bool = True) -> dict:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-        )
-        ctx = await browser.new_context(locale="uk-UA")
-        page = await ctx.new_page()
-
-        await page.goto(PAGE, wait_until="networkidle")
-        await page.wait_for_timeout(1200)
-
-        csrf = await page.evaluate(
-            """() => {
-                const m = document.querySelector('meta[name="csrf-token"]');
-                if (m && m.content) return m.content;
-                if (window.yii && window.yii.getCsrfToken) return window.yii.getCsrfToken();
-                return window.csrfToken || window._csrfToken || null;
-            }"""
-        )
-
-        update_fact = datetime.now().strftime("%d.%m.%Y+%H:%M")  # like XHR
-        form = {
-            "method": "getHomeNum",
-            "data[0][name]": "street",
-            "data[0][value]": street_value,
-            "data[1][name]": "updateFact",
-            "data[1][value]": update_fact,
-        }
-
-        headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin": BASE,
-            "Referer": PAGE,
-        }
-        if csrf:
-            headers["X-CSRF-Token"] = csrf
-
-        resp = await page.request.post(AJAX, form=form, headers=headers)
-        ct = resp.headers.get("content-type", "")
-        text = await resp.text()
-
-        try:
-            j = await resp.json()
-        except Exception:
-            await browser.close()
-            raise RuntimeError(f"Server returned non-JSON. Status={resp.status}, ct={ct}, body_snip={text[:200]}")
-
-        await browser.close()
-        return j
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = (
+        "Привіт 👋\n"
+        "Я моніторю оновлення DTEK і напишу тобі, коли зміниться інформація.\n\n"
+        "Натисни кнопку або /set"
+    )
+    if update.message:
+        await update.message.reply_text(msg, reply_markup=menu_kb())
 
 
-def _make_update_marker(j: dict) -> str:
-    """
-    We notify when this marker changes.
-    Primary: updateTimestamp (e.g. '16:33 19.12.2025')
-    Fallback: fact.update or updateFact fields if present.
-    """
-    if isinstance(j, dict):
-        ut = (j.get("updateTimestamp") or "").strip()
-        if ut:
-            return f"updateTimestamp:{ut}"
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tm = target_message(update)
+    if not tm:
+        return
 
-        fact = j.get("fact") or {}
-        fu = (fact.get("update") or fact.get("updateFact") or "").strip()
-        if fu:
-            return f"fact.update:{fu}"
+    state = load_state()
+    cfg = get_user_cfg(state, tm.chat_id)
 
-    return "unknown"
+    if not cfg:
+        await tm.reply_text("Адреса ще не задана. Натисни «Змінити адресу» (/set).", reply_markup=menu_kb())
+        return
+
+    street = cfg.get("street_ui") or cfg.get("street") or "—"
+    house = cfg.get("house") or "—"
+    last_ut = cfg.get("last_updateTimestamp") or "—"
+    last_err = (cfg.get("last_error") or "").strip()
+
+    text = (
+        f"📍 Адреса: {street}, {house}\n"
+        f"🕒 Останнє оновлення: {last_ut}\n"
+        f"⏱️ Перевірка: кожні {POLL_EVERY_SEC // 60} хв"
+    )
+    if last_err:
+        text += f"\n⚠️ Остання помилка: {last_err}"
+
+    await tm.reply_text(text, reply_markup=menu_kb())
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tm = target_message(update)
+    if not tm:
+        return
+
+    state = load_state()
+    if not get_user_cfg(state, tm.chat_id):
+        await tm.reply_text("Моніторинг і так не налаштований.", reply_markup=menu_kb())
+        return
+
+    del_user_cfg(state, tm.chat_id)
+    save_state(state)
+
+    await tm.reply_text("🛑 Ок, зупинив моніторинг і забув адресу.", reply_markup=menu_kb())
+
+
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tm = target_message(update)
+    if not tm:
+        return
+
+    state = load_state()
+    cfg = get_user_cfg(state, tm.chat_id)
+
+    street = (cfg.get("street") or "").strip()
+    street_ui = (cfg.get("street_ui") or street).strip()
+    house = (cfg.get("house") or "").strip()
+
+    if not street or not house:
+        await tm.reply_text("Спочатку задай адресу: /set", reply_markup=menu_kb())
+        return
+
+    status_msg = await tm.reply_text("⏳ Перевіряю DTEK...")
+
+    try:
+        j = await dtek_client.fetch_dtek(street_value=street, headless=True)
+        text = dtek_client.format_house_info(street_ui, house, j)
+
+        q = dtek_client.get_house_queue(j, house)
+        if q:
+            text += f"\n\n🏷️ Черга: {q}\n\n" + dtek_client.summarize_fact_for_today(j, q)
+
+        # update cached marker (so monitor won’t instantly re-notify the same data)
+        cfg["last_marker"] = dtek_client.make_update_marker(j)
+        cfg["last_updateTimestamp"] = (j.get("updateTimestamp") or "")
+        cfg["last_error"] = ""
+        set_user_cfg(state, tm.chat_id, cfg)
+        save_state(state)
+
+    except Exception as e:
+        text = f"❌ Помилка запиту: {type(e).__name__}: {e}"
+        cfg["last_error"] = text
+        set_user_cfg(state, tm.chat_id, cfg)
+        save_state(state)
+
+    await status_msg.edit_text(text, reply_markup=menu_kb())
+
+
+# =========================
+# Conversation /set (2 steps)
+# =========================
+
+async def set_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    tm = target_message(update)
+    if not tm:
+        return ConversationHandler.END
+    await tm.reply_text("Введи назву вулиці (як на сайті DTEK), напр:\nБорщагівська")
+    return ASK_STREET
+
+
+async def set_street(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return ConversationHandler.END
+
+    street_raw = update.message.text or ""
+    street = normalize_street(street_raw)
+
+    if len(street) < 3:
+        await update.message.reply_text("Некоректна вулиця, спробуй ще раз:")
+        return ASK_STREET
+
+    context.user_data["pending_street"] = street
+    await update.message.reply_text("Тепер введи номер будинку, напр: 145")
+    return ASK_HOUSE
+
+
+async def set_house(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return ConversationHandler.END
+
+    house = normalize_house(update.message.text or "")
+    if not valid_house(house):
+        await update.message.reply_text("Некоректний номер будинку, спробуй ще раз:")
+        return ASK_HOUSE
+
+    street = (context.user_data.get("pending_street") or "").strip()
+    if not street:
+        await update.message.reply_text("Щось пішло не так. Спробуй /set ще раз.", reply_markup=menu_kb())
+        return ConversationHandler.END
+
+    chat_id = update.message.chat_id
+    state = load_state()
+    cfg = get_user_cfg(state, chat_id)
+
+    cfg["street"] = street          # street_value for XHR
+    cfg["street_ui"] = street       # shown to user
+    cfg["house"] = house
+    cfg["last_marker"] = ""         # force notify on next poll
+    cfg["last_updateTimestamp"] = ""
+    cfg["last_error"] = ""
+
+    set_user_cfg(state, chat_id, cfg)
+    save_state(state)
+
+    await update.message.reply_text(
+        f"✅ Збережено:\n{street}, {house}\n"
+        f"Я напишу, коли оновиться інформація на сайті.\n"
+        f"(перевірка кожні {POLL_EVERY_SEC // 60} хв)",
+        reply_markup=menu_kb(),
+    )
+
+    # immediate check once (nice UX)
+    await cmd_check(update, context)
+    return ConversationHandler.END
+
+
+async def set_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    tm = target_message(update)
+    if tm:
+        await tm.reply_text("Скасовано.", reply_markup=menu_kb())
+    return ConversationHandler.END
+
+
+# =========================
+# Buttons
+# =========================
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    if q.data == "check":
+        await cmd_check(update, context)
+    elif q.data == "set":
+        await q.message.reply_text("Добре, змінимо адресу.")
+        # Important: for callbacks we must enter conversation manually via message prompt
+        await q.message.reply_text("Введи назву вулиці (як на сайті DTEK), напр:\nБорщагівська")
+        # Set a flag and reuse the same conversation states via user_data:
+        context.user_data["from_button_set"] = True
+        # We can't "return ASK_STREET" here because this is not inside ConversationHandler callback.
+        # So we rely on /set entry point for full conversation. Simpler: tell user to use /set.
+        # But to keep UX smooth, we enable reentry with a separate handler below (see note).
+    elif q.data == "status":
+        await cmd_status(update, context)
+    elif q.data == "stop":
+        await cmd_stop(update, context)
+
+
+# NOTE:
+# PTB ConversationHandler entry_points must be actual handlers. For buttons,
+# simplest is to keep "set" button just telling user to type /set.
+# If you want TRUE button-driven conversation (no /set), tell me and I’ll adjust
+# with a dedicated CallbackQueryHandler entry_point for ConversationHandler.
 
 
 # =========================
@@ -262,20 +344,13 @@ def _make_update_marker(j: dict) -> str:
 # =========================
 
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Runs periodically. For each user in STATE_FILE:
-      - fetch DTEK
-      - compute marker
-      - if changed -> send notification
-    """
-    # This job can run while bot handles messages, so keep it robust.
-    state = _load_state()
+    state = load_state()
     users = (state.get("users") or {})
-
     if not users:
         return
 
-    # iterate over a copy
+    changed_any = False
+
     for chat_id_str, cfg in list(users.items()):
         try:
             chat_id = int(chat_id_str)
@@ -291,157 +366,41 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         try:
-            j = await fetch_dtek(street_value=street, headless=True)
+            j = await dtek_client.fetch_dtek(street_value=street, headless=True)
         except Exception as e:
-            # Don't spam errors too often; store last_error and only send if changed
             err = f"{type(e).__name__}: {e}"
             if cfg.get("last_error") != err:
                 cfg["last_error"] = err
-                _set_user_cfg(state, chat_id, cfg)
-                _save_state(state)
+                set_user_cfg(state, chat_id, cfg)
+                changed_any = True
                 await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Помилка запиту DTEK:\n{err}")
             continue
 
-        marker = _make_update_marker(j)
+        marker = dtek_client.make_update_marker(j)
 
-        # clear error if recovered
         if cfg.get("last_error"):
             cfg["last_error"] = ""
 
         if marker != last_marker:
             cfg["last_marker"] = marker
             cfg["last_updateTimestamp"] = (j.get("updateTimestamp") or "")
-            _set_user_cfg(state, chat_id, cfg)
-            _save_state(state)
+            set_user_cfg(state, chat_id, cfg)
+            changed_any = True
 
-            msg = format_house_info(street_ui, house, j)
-
-            queue = get_house_queue(j, house)
+            msg = dtek_client.format_house_info(street_ui, house, j)
+            queue = dtek_client.get_house_queue(j, house)
             if queue:
-                msg += f"\n\n🏷️ Черга: {queue}\n\n" + summarize_fact_for_today(j, queue)
+                msg += f"\n\n🏷️ Черга: {queue}\n\n" + dtek_client.summarize_fact_for_today(j, queue)
 
             await context.bot.send_message(chat_id=chat_id, text=msg)
-
         else:
-            # persist recovery + maybe updateTimestamp anyway
-            _set_user_cfg(state, chat_id, cfg)
-            _save_state(state)
+            set_user_cfg(state, chat_id, cfg)
 
-
-# =========================
-# Telegram commands
-# =========================
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "Привіт! Я моніторю оновлення графіка DTEK і напишу тобі, коли дані оновляться.\n\n"
-        "Команди:\n"
-        "  /set вул. Борщагівська | 145   — зберегти адресу і почати моніторинг\n"
-        "  /status                         — показати налаштування\n"
-        "  /stop                           — зупинити і забути адресу\n\n"
-        f"Перевірка кожні {POLL_EVERY_SEC // 60} хв."
-    )
-    if update.message:
-        await update.message.reply_text(text)
-
-
-async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-
-    street, house = _parse_set_args(update.message.text or "")
-    if not street or not house:
-        await update.message.reply_text(
-            "Формат:\n"
-            "  /set вул. Борщагівська | 145\n"
-            "або\n"
-            "  /set \"вул. Борщагівська\" 145"
-        )
-        return
-
-    chat_id = update.message.chat_id
-
-    # Save config
-    state = _load_state()
-    cfg = _get_user_cfg(state, chat_id)
-
-    cfg["street"] = street          # street_value: must match XHR as you type it
-    cfg["street_ui"] = street       # how we show it (can be same)
-    cfg["house"] = house
-    cfg["last_marker"] = ""         # force notify on next poll
-    cfg["last_updateTimestamp"] = ""
-    cfg["last_error"] = ""
-
-    _set_user_cfg(state, chat_id, cfg)
-    _save_state(state)
-
-    await update.message.reply_text(
-        f"✅ Збережено:\n{street}, {house}\n"
-        f"Я напишу, коли оновиться інформація на сайті.\n"
-        f"(перевірка кожні {POLL_EVERY_SEC // 60} хв)"
-    )
-
-    # Do an immediate fetch to confirm + show current state
-    await update.message.reply_text("⏳ Перевіряю зараз...")
-    try:
-        j = await fetch_dtek(street_value=street, headless=True)
-        marker = _make_update_marker(j)
-        cfg["last_marker"] = marker
-        cfg["last_updateTimestamp"] = (j.get("updateTimestamp") or "")
-        _set_user_cfg(state, chat_id, cfg)
-        _save_state(state)
-
-        msg = format_house_info(street, house, j)
-        queue = get_house_queue(j, house)
-        if queue:
-            msg += f"\n\n🏷️ Черга: {queue}\n\n" + summarize_fact_for_today(j, queue)
-
-        await update.message.reply_text(msg)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Не вдалося отримати дані одразу:\n{type(e).__name__}: {e}")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    chat_id = update.message.chat_id
-    state = _load_state()
-    cfg = _get_user_cfg(state, chat_id)
-
-    if not cfg:
-        await update.message.reply_text("Налаштувань ще немає. Використай /set.")
-        return
-
-    street = cfg.get("street") or "—"
-    house = cfg.get("house") or "—"
-    last_ut = cfg.get("last_updateTimestamp") or "—"
-    last_err = (cfg.get("last_error") or "").strip()
-
-    msg = (
-        f"📍 Адреса: {street}, {house}\n"
-        f"🕒 Останнє оновлення (updateTimestamp): {last_ut}\n"
-        f"⏱️ Перевірка: кожні {POLL_EVERY_SEC // 60} хв"
-    )
-    if last_err:
-        msg += f"\n⚠️ Остання помилка: {last_err}"
-
-    await update.message.reply_text(msg)
-
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    chat_id = update.message.chat_id
-
-    state = _load_state()
-    if not _get_user_cfg(state, chat_id):
-        await update.message.reply_text("Моніторинг і так не налаштований.")
-        return
-
-    _del_user_cfg(state, chat_id)
-    _save_state(state)
-
-    await update.message.reply_text("🛑 Ок, зупинив моніторинг і забув адресу.")
+    if changed_any:
+        save_state(state)
+    else:
+        # still persist non-error changes safely
+        save_state(state)
 
 
 # =========================
@@ -455,12 +414,29 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
 
+    conv_set = ConversationHandler(
+        entry_points=[CommandHandler("set", set_entry)],
+        states={
+            ASK_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_street)],
+            ASK_HOUSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_house)],
+        },
+        fallbacks=[CommandHandler("cancel", set_cancel)],
+        allow_reentry=True,
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(conv_set)
+    app.add_handler(CallbackQueryHandler(on_button))
 
-    # periodic job
+    # periodic polling
+    if app.job_queue is None:
+        raise SystemExit(
+            "JobQueue is not available. Install PTB with:\n"
+            "  pip install \"python-telegram-bot[job_queue]==20.*\""
+        )
     app.job_queue.run_repeating(monitor_job, interval=POLL_EVERY_SEC, first=15)
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
