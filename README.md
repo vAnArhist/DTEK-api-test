@@ -9,15 +9,29 @@
 - Buttons for quick actions
 - Periodic polling via PTB JobQueue
 
-Install:
+## Install:
 ```
   pip install "python-telegram-bot[job_queue]==20.*" playwright
   playwright install
 ```
 
-Run:
+## Run:
 ```
-  export BOT_TOKEN="123:ABC"
-  export POLL_EVERY_SEC=300
-  python3 bot.py
+cd /path/to/repo
+BOT_TOKEN="PASTE_NEW_TOKEN_HERE" sudo ./scripts/service.sh install
+```
+
+## Logs:
+```
+./scripts/service.sh logs
+```
+
+## Status
+```
+./scripts/service.sh status
+```
+
+## Uninstall
+```
+sudo ./scripts/service.sh uninstall
 ```

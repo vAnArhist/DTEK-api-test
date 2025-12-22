@@ -1,0 +1,18 @@
+[Unit]
+Description=DTEK API bot/service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{WORKDIR}}
+EnvironmentFile={{ENVFILE}}
+ExecStart={{PYTHON}} {{SCRIPT}}
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

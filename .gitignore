@@ -2,3 +2,5 @@
 __pycache__
 bot_state.json
 users.json
+AWSCreds.txt
+Black&WhiteAWSServer.pem
